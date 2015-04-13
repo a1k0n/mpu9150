@@ -73,6 +73,87 @@ bool ReadMag(Vector3f *mag) {
   return false;
 }
 
+MatrixXd YTY_(10, 10);
+
+bool LoadCalibration() {
+  FILE *fp = fopen("cal.bin", "rb");
+  if (fp) {
+    fread(YTY_.data(), 10*10, sizeof(double), fp);
+    fclose(fp);
+    std::cout << "loaded mag calibration YTY" << std::endl << YTY_ << std::endl;
+    return true;
+  }
+  return false;
+}
+
+bool SaveCalibration() {
+  FILE *fp = fopen("cal.bin", "wb");
+  fwrite(YTY_.data(), 10*10, sizeof(double), fp);
+  fclose(fp);
+  return true;
+}
+
+// returns (approximately unit) vector pointing towards magnetic north, after
+// compensating for ellipsoid shape
+bool CalibrateMag(const Vector3f &mag, Vector3f *north) {
+  // "OLS" solution in Markovsky, Kukush, Van Huffel,
+  // "Consistent Fitting of Ellipsoids"
+  // http://eprints.soton.ac.uk/263295/1/ellest_comp_published.pdf
+  static Eigen::SelfAdjointEigenSolver<MatrixXd> eigen_solver_(10);
+  static Matrix3f proj_;
+  static Vector3f center_;
+  static bool valid_ = false;
+
+  // roll up H^-T Y^T Y H^-1 by doing a rank update of (y H^-1)
+  // H^-1 = 1/sqrt(2) for elements w/ coefficient 2, 1 elsewhere
+  // so 2/sqrt(2) = sqrt(2) = r2
+  const double r2 = sqrt(2.0);  // root 2
+  VectorXd y(10);
+  y << mag[0] * mag[0], r2 * mag[0] * mag[1], r2 * mag[0] * mag[2],
+    mag[1] * mag[1], r2 * mag[1] * mag[2],
+    mag[2] * mag[2],
+    mag[0], mag[1], mag[2], 1.0f;
+  YTY_.selfadjointView<Eigen::Lower>().rankUpdate(y, 1);
+
+  // TODO: only update solution periodically?
+  if (1) {
+    // Solution is the eigenvector corresponding to the smallest eigenvalue,
+    // which is always the first eigenvector returned by eigen_solver
+    eigen_solver_.compute(YTY_);
+    VectorXd B(10);
+    // save in B, then unpack into A, b, d
+    B = eigen_solver_.eigenvectors().col(0);
+    Matrix3f A_;
+    Vector3f b;
+    A_ << B[0], B[1], B[2],
+       0, B[3], B[4],
+       0,    0, B[5];
+    Matrix3f A = A_.selfadjointView<Eigen::Upper>();
+    b << B[6], B[7], B[8];
+    float d = B[9];
+    Eigen::LDLT<Matrix3f> ALDLT = A.ldlt();
+    Vector3f c = -0.5 * ALDLT.solve(b);
+    float scale = 1.0f / (c.transpose() * A * c - d);
+    // if any element in scale * vectorD is <0, then we are not calibrated
+    Vector3f D = scale * ALDLT.vectorD();
+    if (D[0] < 0 || D[1] < 0 || D[2] < 0) {
+      valid_ = false;
+    } else {
+      valid_ = true;
+      Vector3f sqrtD = D.cwiseSqrt();
+      Matrix3f sqrtDD = sqrtD.asDiagonal();
+      proj_ = sqrtDD * ALDLT.matrixU();
+      center_ = c;
+    }
+  }
+
+  if (valid_) {
+    *north = proj_ * (mag - center_);
+  }
+
+  return valid_;
+}
+
 bool ReadIMU(Vector3f *accel, Vector3f *gyro) {
   uint8_t readbuf[14];
   // mpu-9150 accel & gyro
@@ -102,80 +183,24 @@ int main() {
   }
 
   InitMPU9150();
+  LoadCalibration();
 
-  MatrixXd YTY(10, 10);  // TODO: use Triangular
-  const double r2 = sqrt(2.0);  // root 2
-  int nmag = 0;
-  Eigen::SelfAdjointEigenSolver<MatrixXd> eigen_solver(10);
+  time_t t0 = time(NULL);
   for (;;) {
     Vector3f mag;
     if (ReadMag(&mag)) {
-      VectorXd y(10);
-      // roll up H^-T Y^T Y H^-1 by doing a rank update of (y H^-1)
-      // H^-1 = 1/sqrt(2) for elements w/ coefficient 2, 1 elsewhere
-      // so 2/sqrt(2) = sqrt(2) = r2
-      y << mag[0] * mag[0], r2 * mag[0] * mag[1], r2 * mag[0] * mag[2],
-        mag[1] * mag[1], r2 * mag[1] * mag[2],
-        mag[2] * mag[2],
-        mag[0], mag[1], mag[2], 1.0f;
-      YTY.selfadjointView<Eigen::Lower>().rankUpdate(y, 1);
-      nmag++;
-      // printf("%f %f %f\r", mag[0], mag[1], mag[2]);
-      // fflush(stdout);
-      // std::cout << YTY << std::endl;
-#if 1
-      if (nmag > 5) {
-        // Solution is the eigenvector corresponding to the smallest eigenvalue,
-        // which is always the first eigenvector returned by eigen_solver
-        eigen_solver.compute(YTY);
-        VectorXd B(10);
-        // save in B, then unpack into A, b, d
-        B = eigen_solver.eigenvectors().col(0);
-        // std::cout << B.transpose() << std::endl;
-        Matrix3f A_;  // TODO: use triangular/selfadjointView
-        Vector3f b;
-        A_ << B[0], B[1], B[2],
-                 0, B[3], B[4],
-                 0,    0, B[5];
-        Matrix3f A = A_.selfadjointView<Eigen::Upper>();
-        b << B[6], B[7], B[8];
-        float d = B[9];
-        Eigen::LDLT<Matrix3f> ALDLT = A.ldlt();
-        Vector3f c = -0.5 * ALDLT.solve(b);
-        float scale1 = c.transpose() * A * c;
-        float scale = 1.0f / (scale1 - d);
-        Matrix3f Ae = scale * A;  // we don't actually need Ae, just verifying
-        std::cout << "center: " << c.transpose();
-        // std::cout << "Ae: (scale1=" << scale1 << " scale=" << scale << ")\n"
-        //     << Ae << std::endl;
-        float scale2 = (mag - c).transpose() * Ae * (mag - c);
-        std::cout << " D: " << (scale * ALDLT.vectorD()).transpose()
-            << std::endl;
-        // if any element in scale * vectorD is <0, then we are not calibrated
-        Vector3f sqrtD = (scale * ALDLT.vectorD()).cwiseSqrt();
-        Matrix3f sqrtDD = sqrtD.asDiagonal();
-        Matrix3f proj = sqrtDD * ALDLT.matrixU();
-        std::cout << mag.transpose() << " -> (" << scale2 << ") "
-            << (proj * (mag - c)).transpose() << std::endl;
+      if (CalibrateMag(mag, &mag)) {
+        printf("%f %f %f\e[K\r", mag[0], mag[1], mag[2]);
+        fflush(stdout);
+        time_t t1 = time(NULL);
+        if (t1 >= (t0 + 10)) {
+          t0 = t1;
+          SaveCalibration();
+          printf("[saved calibration]\e[K\n");
+        }
       }
-#endif
     }
   }
-  /*
-  timeval t1;
-  gettimeofday(&t1, NULL);
-  printf("%d.%06d\n", t1.tv_sec, t1.tv_usec);
-  t1.tv_sec -= t0.tv_sec;
-  t1.tv_usec -= t0.tv_usec;
-  if (t1.tv_usec < 0) {
-    t1.tv_usec += 1000000;
-    t1.tv_sec += 1;
-  }
-  float dt = (t1.tv_sec + t1.tv_usec / 1e6f);
-  float rate = naccel / dt;
-  printf("%d.%06d %d %d %f/sec\n",
-         t1.tv_sec, t1.tv_usec, naccel, nmag, rate);
-         */
 
   return 0;
 }
