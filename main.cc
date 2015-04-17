@@ -75,13 +75,88 @@ bool ReadMag(Vector3f *mag) {
 
 MatrixXd YTY_(10, 10);
 
+Matrix3f proj_;
+Vector3f center_;
+
+// Fits an ellipsoid to the input data using least-squares.
+//
+// Solution takes the same amount of time no matter how many datapoints were
+// added in to YTY_, but they need to be good datapoints as least squares is
+// not robust to outliers.
+//
+// "OLS" solution in Markovsky, Kukush, Van Huffel,
+// "Consistent Fitting of Ellipsoids"
+// http://eprints.soton.ac.uk/263295/1/ellest_comp_published.pdf
+bool SolveMagCalibration() {
+  static Eigen::SelfAdjointEigenSolver<MatrixXd> eigen_solver_(10);
+  // Solution is the eigenvector corresponding to the smallest eigenvalue,
+  // which is always the first eigenvector returned by eigen_solver
+  eigen_solver_.compute(YTY_);
+  VectorXd B(10);
+  // save in B, then unpack into A, b, d
+  B = eigen_solver_.eigenvectors().col(0);
+  Matrix3f A_;
+  Vector3f b;
+  A_ << B[0], B[1], B[2],
+     0, B[3], B[4],
+     0,    0, B[5];
+  Matrix3f A = A_.selfadjointView<Eigen::Upper>();
+  b << B[6], B[7], B[8];
+  float d = B[9];
+  Eigen::LDLT<Matrix3f> ALDLT = A.ldlt();
+  Vector3f c = -0.5 * ALDLT.solve(b);
+  float scale = 1.0f / (c.transpose() * A * c - d);
+  // if any element in scale * vectorD is <0, then we are not calibrated
+  Vector3f D = scale * ALDLT.vectorD();
+  if (D[0] < 0 || D[1] < 0 || D[2] < 0) {
+    return false;
+  }
+
+  Vector3f sqrtD = D.cwiseSqrt();
+  Matrix3f sqrtDD = sqrtD.asDiagonal();
+  proj_ = sqrtDD * ALDLT.matrixU();
+  center_ = c;
+
+  return true;
+}
+
+// returns (approximately unit) vector pointing towards magnetic north, after
+// compensating for ellipsoid shape
+bool CalibrateMag(const Vector3f &mag, bool is_calibrated, Vector3f *north) {
+  if (!is_calibrated) {
+    // Add our datapoint to the YTY_ matrix.
+    //
+    // roll up H^-T Y^T Y H^-1 by doing a rank update of (y H^-1)
+    // H^-1 = 1/sqrt(2) for elements w/ coefficient 2, 1 elsewhere
+    // so 2/sqrt(2) = sqrt(2) = r2
+    const double r2 = sqrt(2.0);  // root 2
+    VectorXd y(10);
+    y << mag[0] * mag[0], r2 * mag[0] * mag[1], r2 * mag[0] * mag[2],
+      mag[1] * mag[1], r2 * mag[1] * mag[2],
+      mag[2] * mag[2],
+      mag[0], mag[1], mag[2], 1.0f;
+    YTY_.selfadjointView<Eigen::Lower>().rankUpdate(y, 1);
+
+    if (!SolveMagCalibration())
+      return false;
+  }
+
+  *north = proj_ * (mag - center_);
+  return true;
+}
+
 bool LoadMagCalibration() {
+  // what we store in magcal.bin is actually the raw cumulative sufficient
+  // statistics, so we need to recompute the projection also
   FILE *fp = fopen("magcal.bin", "rb");
   if (fp) {
     fread(YTY_.data(), 10*10, sizeof(double), fp);
     fclose(fp);
-    // std::cout << "loaded mag calibration YTY" << std::endl << YTY_ << std::endl;
-    return true;
+    if (SolveMagCalibration()) {
+      std::cout << "mag calibration center " << center_.transpose()
+          << " projection:" << std::endl << proj_ << std::endl;
+      return true;
+    }
   }
   return false;
 }
@@ -91,66 +166,6 @@ bool SaveMagCalibration() {
   fwrite(YTY_.data(), 10*10, sizeof(double), fp);
   fclose(fp);
   return true;
-}
-
-// returns (approximately unit) vector pointing towards magnetic north, after
-// compensating for ellipsoid shape
-bool CalibrateMag(const Vector3f &mag, bool is_calibrated, Vector3f *north) {
-  // "OLS" solution in Markovsky, Kukush, Van Huffel,
-  // "Consistent Fitting of Ellipsoids"
-  // http://eprints.soton.ac.uk/263295/1/ellest_comp_published.pdf
-  static Eigen::SelfAdjointEigenSolver<MatrixXd> eigen_solver_(10);
-  static Matrix3f proj_;
-  static Vector3f center_;
-  static bool valid_ = false;
-
-  // roll up H^-T Y^T Y H^-1 by doing a rank update of (y H^-1)
-  // H^-1 = 1/sqrt(2) for elements w/ coefficient 2, 1 elsewhere
-  // so 2/sqrt(2) = sqrt(2) = r2
-  const double r2 = sqrt(2.0);  // root 2
-  VectorXd y(10);
-  y << mag[0] * mag[0], r2 * mag[0] * mag[1], r2 * mag[0] * mag[2],
-    mag[1] * mag[1], r2 * mag[1] * mag[2],
-    mag[2] * mag[2],
-    mag[0], mag[1], mag[2], 1.0f;
-  YTY_.selfadjointView<Eigen::Lower>().rankUpdate(y, 1);
-
-  if (!is_calibrated) {
-    // Solution is the eigenvector corresponding to the smallest eigenvalue,
-    // which is always the first eigenvector returned by eigen_solver
-    eigen_solver_.compute(YTY_);
-    VectorXd B(10);
-    // save in B, then unpack into A, b, d
-    B = eigen_solver_.eigenvectors().col(0);
-    Matrix3f A_;
-    Vector3f b;
-    A_ << B[0], B[1], B[2],
-       0, B[3], B[4],
-       0,    0, B[5];
-    Matrix3f A = A_.selfadjointView<Eigen::Upper>();
-    b << B[6], B[7], B[8];
-    float d = B[9];
-    Eigen::LDLT<Matrix3f> ALDLT = A.ldlt();
-    Vector3f c = -0.5 * ALDLT.solve(b);
-    float scale = 1.0f / (c.transpose() * A * c - d);
-    // if any element in scale * vectorD is <0, then we are not calibrated
-    Vector3f D = scale * ALDLT.vectorD();
-    if (D[0] < 0 || D[1] < 0 || D[2] < 0) {
-      valid_ = false;
-    } else {
-      valid_ = true;
-      Vector3f sqrtD = D.cwiseSqrt();
-      Matrix3f sqrtDD = sqrtD.asDiagonal();
-      proj_ = sqrtDD * ALDLT.matrixU();
-      center_ = c;
-    }
-  }
-
-  if (valid_) {
-    *north = proj_ * (mag - center_);
-  }
-
-  return valid_;
 }
 
 bool ReadIMU(Vector3f *accel, Vector3f *gyro) {
