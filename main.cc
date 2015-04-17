@@ -37,10 +37,10 @@ bool InitMPU9150() {
 
   uint8_t id;
   i2c_read(i2cfd_, 0x68, 117, 1, &id);  // whoami
-  printf("\r\nMPU-9150 id: %02x\r\n", id);
+  fprintf(stderr, "\r\nMPU-9150 id: %02x\r\n", id);
 
   i2c_read(i2cfd_, 0x0c, 0x00, 1, &id);  // mag device id
-  printf("AK8975C id: %02x\r\n", id);
+  fprintf(stderr, "AK8975C id: %02x\r\n", id);
 
   uint8_t magadj8[3];
   i2c_write(i2cfd_, 0x0c, 0x0a, 0x0f);  // mag fuse rom access
@@ -51,7 +51,7 @@ bool InitMPU9150() {
       1 + (magadj8[1] - 128.0f) / 256.0f,
       1 + (magadj8[2] - 128.0f) / 256.0f);
 
-  printf("AK8975C mag adjust: %f %f %f\r\n",
+  fprintf(stderr, "AK8975C mag adjust: %f %f %f\r\n",
          magadj_[0], magadj_[1], magadj_[2]);
 
   return true;  // FIXME
@@ -75,19 +75,19 @@ bool ReadMag(Vector3f *mag) {
 
 MatrixXd YTY_(10, 10);
 
-bool LoadCalibration() {
-  FILE *fp = fopen("cal.bin", "rb");
+bool LoadMagCalibration() {
+  FILE *fp = fopen("magcal.bin", "rb");
   if (fp) {
     fread(YTY_.data(), 10*10, sizeof(double), fp);
     fclose(fp);
-    std::cout << "loaded mag calibration YTY" << std::endl << YTY_ << std::endl;
+    // std::cout << "loaded mag calibration YTY" << std::endl << YTY_ << std::endl;
     return true;
   }
   return false;
 }
 
-bool SaveCalibration() {
-  FILE *fp = fopen("cal.bin", "wb");
+bool SaveMagCalibration() {
+  FILE *fp = fopen("magcal.bin", "wb");
   fwrite(YTY_.data(), 10*10, sizeof(double), fp);
   fclose(fp);
   return true;
@@ -95,7 +95,7 @@ bool SaveCalibration() {
 
 // returns (approximately unit) vector pointing towards magnetic north, after
 // compensating for ellipsoid shape
-bool CalibrateMag(const Vector3f &mag, Vector3f *north) {
+bool CalibrateMag(const Vector3f &mag, bool is_calibrated, Vector3f *north) {
   // "OLS" solution in Markovsky, Kukush, Van Huffel,
   // "Consistent Fitting of Ellipsoids"
   // http://eprints.soton.ac.uk/263295/1/ellest_comp_published.pdf
@@ -115,8 +115,7 @@ bool CalibrateMag(const Vector3f &mag, Vector3f *north) {
     mag[0], mag[1], mag[2], 1.0f;
   YTY_.selfadjointView<Eigen::Lower>().rankUpdate(y, 1);
 
-  // TODO: only update solution periodically?
-  if (1) {
+  if (!is_calibrated) {
     // Solution is the eigenvector corresponding to the smallest eigenvalue,
     // which is always the first eigenvector returned by eigen_solver
     eigen_solver_.compute(YTY_);
@@ -183,21 +182,25 @@ int main() {
   }
 
   InitMPU9150();
-  LoadCalibration();
+  bool mag_calibrated = LoadMagCalibration();
 
   time_t t0 = time(NULL);
   for (;;) {
     Vector3f mag;
     if (ReadMag(&mag)) {
-      if (CalibrateMag(mag, &mag)) {
-        printf("%f %f %f\e[K\r", mag[0], mag[1], mag[2]);
+      if (CalibrateMag(mag, mag_calibrated, &mag)) {
+        printf("[%f,%f,%f]\n", mag[0], mag[1], mag[2]);
         fflush(stdout);
         time_t t1 = time(NULL);
+        // if we've spent 10 seconds in a row calibrated, save it
         if (t1 >= (t0 + 10)) {
           t0 = t1;
-          SaveCalibration();
-          printf("[saved calibration]\e[K\n");
+          SaveMagCalibration();
+          mag_calibrated = true;
+          fprintf(stderr, "[saved calibration]\e[K\n");
         }
+      } else {
+        t0 = time(NULL);
       }
     }
   }
