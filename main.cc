@@ -45,7 +45,8 @@ bool InitMPU9150() {
   uint8_t magadj8[3];
   i2c_write(i2cfd_, 0x0c, 0x0a, 0x0f);  // mag fuse rom access
   i2c_read(i2cfd_, 0x0c, 0x10, 3, magadj8);  // mag device id
-  i2c_write(i2cfd_, 0x0c, 0x0a, 0x01);  // mag enable
+  // i2c_write(i2cfd_, 0x0c, 0x0a, 0x01);  // single read (ak8975c only)
+  i2c_write(i2cfd_, 0x0c, 0x0a, 0x16);  // 100Hz continuous 16-bit (ak8963c)
   magadj_ = Vector3f(
       1 + (magadj8[0] - 128.0f) / 256.0f,
       1 + (magadj8[1] - 128.0f) / 256.0f,
@@ -59,14 +60,14 @@ bool InitMPU9150() {
 
 bool ReadMag(Vector3f *mag) {
   uint8_t readbuf[14];
-  if (i2c_read(i2cfd_, 0x0c, 2, 1, readbuf)) {  // akc8075c magnetometer
+  if (i2c_read(i2cfd_, 0x0c, 2, 1, readbuf)) {  // ak8963c/75c magnetometer
     if (readbuf[0] & 0x01) {
-      i2c_read(i2cfd_, 0x0c, 0x03, 6, readbuf);
+      i2c_read(i2cfd_, 0x0c, 0x03, 7, readbuf);
       int16_t x = (readbuf[1] << 8) | readbuf[0],
               y = (readbuf[3] << 8) | readbuf[2],
               z = (readbuf[5] << 8) | readbuf[4];
       *mag = Vector3f(x, y, z).cwiseProduct(magadj_);
-      i2c_write(i2cfd_, 0x0c, 0x0a, 0x01);  // mag enable
+      // i2c_write(i2cfd_, 0x0c, 0x0a, 0x01);  // single read (75c only)
       return true;
     }
   }
@@ -168,20 +169,24 @@ bool SaveMagCalibration() {
   return true;
 }
 
-bool ReadIMU(Vector3f *accel, Vector3f *gyro) {
+bool ReadIMU(Vector3f *accel, Vector3f *gyro, float *temp) {
   uint8_t readbuf[14];
   // mpu-9150 accel & gyro
   if (i2c_read(i2cfd_, 0x68, 0x3b, 14, readbuf)) {
     int16_t ax = (readbuf[0] << 8) | readbuf[1],
             ay = (readbuf[2] << 8) | readbuf[3],
             az = (readbuf[4] << 8) | readbuf[5];
-    // int16_t t = (readbuf[6] << 8) | readbuf[7];
+    int16_t t  = (readbuf[6] << 8) | readbuf[7];
     int16_t gx = (readbuf[ 8] << 8) | readbuf[ 9],
             gy = (readbuf[10] << 8) | readbuf[11],
             gz = (readbuf[12] << 8) | readbuf[13];
-    *accel = Vector3f(ax, ay, az);
+    // we are in 16384 LSB/g scale (+/- 2g)
+    *accel = Vector3f(ax, ay, az) / 16384.0;
     // TODO: temp calibration
-    *gyro = Vector3f(gx, gy, gz);
+    // we are in +/- 250 degrees/second full scale range
+    // return radians/second
+    *gyro = Vector3f(gx, gy, gz) * 250.0 * M_PI / (180 * 32768.0);
+    *temp = t * (1.0/340.0) + 35;
     return true;
   }
   return false;
@@ -201,10 +206,15 @@ int main() {
 
   time_t t0 = time(NULL);
   for (;;) {
-    Vector3f mag;
+    Vector3f mag, acc, gyro;
+    float temp;
     if (ReadMag(&mag)) {
+      ReadIMU(&acc, &gyro, &temp);
       if (CalibrateMag(mag, mag_calibrated, &mag)) {
-        printf("[%f,%f,%f]\n", mag[0], mag[1], mag[2]);
+        printf("m [%f,%f,%f] a [%f,%f,%f] g [%f,%f,%f] temp %0.2f C\n",
+               mag[0], mag[1], mag[2],
+               acc[0], acc[1], acc[2],
+               gyro[0], gyro[1], gyro[2], temp);
         fflush(stdout);
         time_t t1 = time(NULL);
         // if we've spent 10 seconds in a row calibrated, save it
